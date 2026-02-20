@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -16,6 +17,8 @@ import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+from ctypes import wintypes
 
 from brain_agent import BrainAction, GeminiBrain
 
@@ -50,6 +53,17 @@ class RunResult:
     artifacts_dir: str
     steps: int
     error_code: str | None = None
+
+
+if platform.system() == "Windows":
+    _windll_loader = getattr(ctypes, "WinDLL", ctypes.CDLL)
+    _USER32: Any = _windll_loader("user32", use_last_error=True)
+    _SW_RESTORE = 9
+else:  # pragma: no cover - non-Windows runtime
+    _USER32 = None
+    _SW_RESTORE = 9
+
+_WINFUNCTYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,45 +142,141 @@ def score_installer_candidate(path: Path) -> int:
     return score
 
 
-def launch_installer(installer_path: Path, run_as_admin: bool) -> subprocess.Popen[bytes] | None:
+def launch_installer(
+    installer_path: Path,
+    run_as_admin: bool,
+) -> tuple[subprocess.Popen[bytes] | None, int | None]:
     if run_as_admin:
         cmd = (
             "Start-Process "
             f"-FilePath '{str(installer_path)}' "
-            "-Verb RunAs"
+            "-Verb RunAs "
+            "-PassThru | Select-Object -ExpandProperty Id"
         )
-        subprocess.run(
+        completed = subprocess.run(
             ["powershell", "-NoProfile", "-Command", cmd],
             check=True,
             capture_output=True,
             text=True,
         )
-        return None
+        pid = None
+        for token in completed.stdout.split():
+            if token.strip().isdigit():
+                pid = int(token.strip())
+                break
+        return None, pid
 
     if installer_path.suffix.lower() == ".msi":
         args = ["msiexec", "/i", str(installer_path)]
     else:
         args = [str(installer_path)]
-    return subprocess.Popen(args)
+    process = subprocess.Popen(args)
+    return process, process.pid
+
+
+def _window_title(hwnd: int) -> str:
+    user32 = _USER32
+    if user32 is None or hwnd == 0:
+        return ""
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value
+
+
+def _window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    user32 = _USER32
+    if user32 is None or hwnd == 0:
+        return None
+    rect = wintypes.RECT()
+    if user32.GetWindowRect(hwnd, ctypes.byref(rect)) == 0:
+        return None
+    return rect.left, rect.top, rect.right, rect.bottom
+
+
+def _find_visible_window_for_pid(pid: int) -> int | None:
+    user32 = _USER32
+    if user32 is None:
+        return None
+
+    matches: list[int] = []
+
+    @_WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def _enum(hwnd: int, _lparam: int) -> bool:
+        if user32.IsWindowVisible(hwnd) == 0:
+            return True
+        proc_id = ctypes.c_ulong(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+        if int(proc_id.value) != pid:
+            return True
+        title = _window_title(hwnd)
+        if title.strip():
+            matches.append(hwnd)
+        return True
+
+    user32.EnumWindows(_enum, 0)
+    if matches:
+        return matches[0]
+    return None
+
+
+def focus_installer_window(installer_pid: int | None) -> bool:
+    user32 = _USER32
+    if installer_pid is None or user32 is None:
+        return False
+    hwnd = _find_visible_window_for_pid(installer_pid)
+    if hwnd is None:
+        return False
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, _SW_RESTORE)
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.15)
+    return True
 
 
 def active_window_title() -> str:
-    return ""
+    user32 = _USER32
+    if user32 is None:
+        return ""
+    hwnd = user32.GetForegroundWindow()
+    return _window_title(hwnd)
 
 
-def capture_observation(step_index: int, screenshots_dir: Path) -> Observation:
+def capture_observation(step_index: int, screenshots_dir: Path, installer_pid: int | None) -> Observation:
     if pyautogui is None:
         raise RuntimeError(f"pyautogui is required: {_PYAUTOGUI_IMPORT_ERROR}")
 
     path = screenshots_dir / f"step-{step_index:03d}.png"
-    image = pyautogui.screenshot()
+    region = None
+    window_title = active_window_title()
+
+    if installer_pid is not None:
+        hwnd = _find_visible_window_for_pid(installer_pid)
+        if hwnd is not None:
+            rect = _window_rect(hwnd)
+            if rect is not None:
+                left, top, right, bottom = rect
+                width = right - left
+                height = bottom - top
+                if width > 0 and height > 0:
+                    region = (left, top, width, height)
+                    window_title = _window_title(hwnd)
+
+    if region is None and installer_pid is not None:
+        focused = focus_installer_window(installer_pid)
+        if focused:
+            window_title = active_window_title()
+
+    image = pyautogui.screenshot(region=region) if region is not None else pyautogui.screenshot()
     image.save(path)
     image_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     return Observation(
         step_index=step_index,
         screenshot_path=str(path),
         state_hash=image_hash,
-        window_title=active_window_title(),
+        window_title=window_title,
         timestamp=time.time(),
     )
 
@@ -272,7 +382,7 @@ def main() -> int:
         return 2
 
     try:
-        process = launch_installer(installer_path, args.run_as_admin)
+        process, installer_pid = launch_installer(installer_path, args.run_as_admin)
     except Exception as exc:
         result = RunResult(
             status="failed",
@@ -286,6 +396,7 @@ def main() -> int:
         return 2
 
     time.sleep(2.0)
+    focus_installer_window(installer_pid)
     repeated_hash_count = 0
     previous_hash = ""
     previous_ocr = ""
@@ -296,7 +407,7 @@ def main() -> int:
 
     for step in range(1, args.max_steps + 1):
         step_count = step
-        obs = capture_observation(step, screenshots_dir)
+        obs = capture_observation(step, screenshots_dir, installer_pid)
         if obs.state_hash == previous_hash:
             repeated_hash_count += 1
         else:
