@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--file", required=True, help="Path to .exe/.msi/.zip")
     parser.add_argument("--zip-password", default=None, help="Optional zip password")
     parser.add_argument("--gemini-api-key", default=None, help="Gemini API key override")
-    parser.add_argument("--model", default="gemini-2.0-flash", help="Gemini model")
+    parser.add_argument("--model", default="gemini-3-flash-preview", help="Gemini model")
     parser.add_argument("--max-steps", type=int, default=80, help="Maximum UI steps")
     parser.add_argument("--step-delay", type=float, default=1.4, help="Delay between steps")
     parser.add_argument("--run-as-admin", action="store_true", help="Run installer elevated")

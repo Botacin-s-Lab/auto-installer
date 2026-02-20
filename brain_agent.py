@@ -50,7 +50,7 @@ class BrainDecision:
 class GeminiBrain:
     """Wraps Gemini OCR + reasoning for next-step keyboard actions."""
 
-    def __init__(self, api_key: str | None = None, model: str = "gemini-2.0-flash") -> None:
+    def __init__(self, api_key: str | None = None, model: str = "gemini-3-flash-preview") -> None:
         key = api_key or os.environ.get("GEMINI_API_KEY")
         if not key:
             raise RuntimeError("GEMINI_API_KEY is not set")
